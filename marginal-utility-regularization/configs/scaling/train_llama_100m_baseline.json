@@ -1,0 +1,43 @@
+{
+  "dataset_name": "HuggingFaceFW/fineweb-edu",
+  "dataset_config": null,
+  "text_column": "text",
+  "train_split": "train",
+  "eval_split": "validation",
+  "block_size": 1024,
+  "batch_size": 2,
+  "eval_batch_size": 2,
+  "learning_rate": 0.0003,
+  "weight_decay": 0.1,
+  "num_train_steps": 10000,
+  "warmup_steps": 1000,
+  "eval_steps": 1000,
+  "save_steps": 10000,
+  "log_steps": 50,
+  "gradient_accumulation_steps": 1,
+  "max_grad_norm": 1.0,
+  "seed": 42,
+  "tokenizer_name": "gpt2",
+  "run_name": "auto",
+  "output_dir": "runs/{run_name}",
+  "model": {
+    "arch": "llama",
+    "vocab_size": 50257,
+    "hidden_size": 768,
+    "num_layers": 10,
+    "num_heads": 12,
+    "max_position_embeddings": 1024,
+    "attn_dropout": 0.0,
+    "resid_dropout": 0.0,
+    "embd_dropout": 0.1,
+    "tie_word_embeddings": false,
+    "intermediate_size": 2048,
+    "rms_norm_eps": 1e-05,
+    "rope_theta": 10000.0,
+    "bos_token_id": 50256,
+    "eos_token_id": 50256
+  },
+  "mur": {
+    "enabled": false
+  }
+}

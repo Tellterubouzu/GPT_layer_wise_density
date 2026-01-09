@@ -1,6 +1,6 @@
 {
-  "run_name": "exp_small_mur_loss",
-  "output_dir": "runs/exp_small_mur_loss",
+  "run_name": "auto",
+  "output_dir": "runs/{run_name}",
   "model_name": "gpt2",
   "dataset_name": "openwebtext",
   "dataset_config": null,
@@ -10,7 +10,7 @@
   "block_size": 256,
   "batch_size": 2,
   "eval_batch_size": 2,
-  "learning_rate": 5e-5,
+  "learning_rate": 5e-05,
   "weight_decay": 0.01,
   "num_train_steps": 200,
   "warmup_steps": 20,
@@ -33,7 +33,7 @@
     "ramp_steps": 100,
     "token_reduce": "sample_k",
     "sample_k": 32,
-    "eps": 1e-6,
+    "eps": 1e-06,
     "fp32_dot": true,
     "log_layer_stats": false
   }

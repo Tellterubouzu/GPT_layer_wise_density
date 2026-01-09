@@ -1,19 +1,24 @@
 import json
 import math
 import os
+import time
+from datetime import datetime
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional
 
 import torch
 from datasets import load_dataset
 from torch.utils.data import DataLoader
-from transformers import AdamW, AutoModelForCausalLM, AutoTokenizer, get_linear_schedule_with_warmup
+from transformers import AdamW, get_linear_schedule_with_warmup
 
 from models.block_access import get_transformer_blocks
+from models.checkpointing import save_model_state
 from models.hidden_state_utils import hidden_states_to_deltas, resolve_layer_indices
+from models.model_factory import build_model, build_tokenizer
 from mur.optimizer_scaling import compute_layer_multipliers, scale_layer_grads
 from mur.regularizer import hinge_floor, schedule_value
 from mur.utility import compute_metric_values, reduce_token_values
+from utils.config import save_config
 from utils.data import build_dataloader
 from utils.logging import setup_logger
 from utils.metrics_store import MetricsStore
@@ -142,18 +147,22 @@ def _layer_stats(layer_means: List[float], tau: float) -> Dict[str, float]:
     return {"mur_mean": mean_value, "mur_frac_below_tau": frac_below}
 
 
-def train(config: Dict[str, Any]) -> None:
-    output_dir = config["output_dir"]
-    os.makedirs(output_dir, exist_ok=True)
+def _infer_run_name(config: Dict[str, Any], param_count_m: float) -> str:
+    model_cfg = config.get("model", {})
+    arch = model_cfg.get("arch", "gpt2")
+    if arch == "transformer++":
+        arch = "transformer_pp"
+    variant = "mur" if config.get("mur", {}).get("enabled", False) else "baseline"
+    size_tag = f"{int(round(param_count_m))}m"
+    date_tag = datetime.now().strftime("%Y%m%d")
+    return f"{arch}_{size_tag}_{variant}_{date_tag}"
 
-    logger = setup_logger("train", os.path.join(output_dir, "train.log"))
+
+def train(config: Dict[str, Any]) -> None:
     set_seed(config.get("seed", 42))
 
-    tokenizer = AutoTokenizer.from_pretrained(config["model_name"])
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-
-    model = AutoModelForCausalLM.from_pretrained(config["model_name"])
+    tokenizer = build_tokenizer(config)
+    model = build_model(config)
     model.train()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -184,6 +193,34 @@ def train(config: Dict[str, Any]) -> None:
         optimizer, num_warmup_steps=config["warmup_steps"], num_training_steps=config["num_train_steps"]
     )
 
+    param_count = sum(p.numel() for p in model.parameters())
+    param_count_m = param_count / 1e6
+    run_name = _infer_run_name(config, param_count_m)
+    config["project_name"] = "marginal-utility-regularization"
+    config["run_name"] = run_name
+
+    output_dir = config.get("output_dir")
+    if not output_dir or output_dir == "auto":
+        output_dir = os.path.join("runs", run_name)
+    elif "{run_name}" in output_dir:
+        output_dir = output_dir.format(run_name=run_name)
+    config["output_dir"] = output_dir
+    os.makedirs(output_dir, exist_ok=True)
+
+    logger = setup_logger("train", os.path.join(output_dir, "train.log"))
+    save_config(config, os.path.join(output_dir, "config.json"))
+
+    with open(os.path.join(output_dir, "model_params.json"), "w", encoding="utf-8") as f:
+        json.dump({"param_count": param_count, "param_count_m": param_count_m}, f, indent=2, ensure_ascii=True)
+
+    model_cfg = config.get("model")
+    if model_cfg and model_cfg.get("vocab_size") and model_cfg.get("vocab_size") != len(tokenizer):
+        logger.warning(
+            "Tokenizer vocab size (%d) does not match model vocab size (%d)",
+            len(tokenizer),
+            model_cfg.get("vocab_size"),
+        )
+
     mur_cfg = _resolve_mur_cfg(config.get("mur", {}))
     train_metrics = MetricsStore(os.path.join(output_dir, "metrics", "train.jsonl"))
     eval_metrics = MetricsStore(os.path.join(output_dir, "metrics", "eval.jsonl"))
@@ -195,6 +232,12 @@ def train(config: Dict[str, Any]) -> None:
     layer_indices: Optional[List[int]] = None
     mur_accum: Optional[MurAccumulator] = None
     blocks: Optional[List[torch.nn.Module]] = None
+
+    seen_tokens = 0
+    log_tokens = 0
+    log_loss_sum = 0.0
+    log_steps = 0
+    last_log_time = time.time()
 
     logger.info("Starting training")
 
@@ -268,11 +311,27 @@ def train(config: Dict[str, Any]) -> None:
             scheduler.step()
             optimizer.zero_grad()
 
+        tokens_in_step = input_ids.numel()
+        seen_tokens += tokens_in_step
+        log_tokens += tokens_in_step
+        log_loss_sum += lm_loss.item()
+        log_steps += 1
+
         if step % config["log_steps"] == 0:
+            elapsed = max(1e-8, time.time() - last_log_time)
+            train_loss = log_loss_sum / max(1, log_steps)
             stats = _layer_stats(layer_means, mur_cfg.tau) if mur_cfg.enabled else {}
             record = {
+                "project_name": config["project_name"],
+                "run_name": config["run_name"],
                 "step": step,
                 "lm_loss": lm_loss.item(),
+                "train_loss": train_loss,
+                "train_perplexity": math.exp(train_loss),
+                "token_per_sec": log_tokens / elapsed,
+                "VRAM_allocated_bytes": torch.cuda.memory_allocated(device) if device.type == "cuda" else 0,
+                "seened_tokens": seen_tokens,
+                "current_lr": scheduler.get_last_lr()[0],
                 "mur_loss": mur_loss.item(),
                 "mur_weight": mur_weight,
                 "total_loss": total_loss.item() * grad_accum,
@@ -284,6 +343,10 @@ def train(config: Dict[str, Any]) -> None:
                 record["mur_layer_means"] = layer_means
             train_metrics.write(record)
             logger.info(json.dumps(record, ensure_ascii=True))
+            last_log_time = time.time()
+            log_tokens = 0
+            log_loss_sum = 0.0
+            log_steps = 0
 
         if step % config["eval_steps"] == 0:
             eval_loss = evaluate(model, eval_loader, device)
@@ -292,7 +355,7 @@ def train(config: Dict[str, Any]) -> None:
             logger.info(json.dumps(eval_record, ensure_ascii=True))
 
         if step % config["save_steps"] == 0 or step == num_steps:
-            model.save_pretrained(output_dir)
+            save_model_state(model, output_dir)
             tokenizer.save_pretrained(output_dir)
 
     logger.info("Training completed")

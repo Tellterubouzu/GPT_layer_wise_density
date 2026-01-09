@@ -10,4 +10,6 @@ def get_transformer_blocks(model: torch.nn.Module) -> List[torch.nn.Module]:
         return list(model.gpt_neox.layers)
     if hasattr(model, "model") and hasattr(model.model, "layers"):
         return list(model.model.layers)
+    if hasattr(model, "layers"):
+        return list(model.layers)
     raise ValueError("Unsupported model architecture for layer access")

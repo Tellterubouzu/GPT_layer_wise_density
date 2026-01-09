@@ -7,12 +7,13 @@ sys.path.append(os.path.join(os.path.dirname(__file__), "..", "src"))
 
 import torch
 from datasets import load_dataset
-from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from eval.bi_metric import compute_bi_metric
 from eval.layer_drop import compute_layer_drop
 from eval.mur_stats import compute_mur_stats
 from eval.ppl import compute_ppl
+from models.checkpointing import load_model_state
+from models.model_factory import build_model, build_tokenizer
 from utils.config import apply_overrides, load_config
 from utils.data import build_dataloader
 from utils.logging import setup_logger
@@ -31,20 +32,27 @@ def main() -> None:
 
     set_seed(config.get("seed", 42))
 
-    model_path = args.run_dir or config["model_name"]
     output_dir = args.run_dir or "runs/eval"
     os.makedirs(output_dir, exist_ok=True)
 
     logger = setup_logger("eval", os.path.join(output_dir, "eval.log"))
-    logger.info("Loading model: %s", model_path)
+    model_config = config
+    if args.run_dir:
+        run_config_path = os.path.join(args.run_dir, "config.json")
+        if os.path.exists(run_config_path):
+            model_config = load_config(run_config_path)
+            if "tokenizer_name" not in model_config and "tokenizer_name" in config:
+                model_config["tokenizer_name"] = config["tokenizer_name"]
 
-    tokenizer = AutoTokenizer.from_pretrained(model_path)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-    model = AutoModelForCausalLM.from_pretrained(model_path)
+    tokenizer = build_tokenizer(model_config)
+    model = build_model(model_config)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
+    if args.run_dir:
+        loaded = load_model_state(model, args.run_dir, map_location=device)
+        if not loaded:
+            logger.warning("Model state not found in %s; using random initialization", args.run_dir)
 
     raw_eval = load_dataset(config["dataset_name"], config.get("dataset_config"), split=config["eval_split"])
     eval_loader = build_dataloader(
