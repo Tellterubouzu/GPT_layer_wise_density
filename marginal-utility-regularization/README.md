@@ -68,5 +68,5 @@ python3 scripts/plot_scaling.py --runs_dir runs --out_dir runs/plots
 - `mur.mode=loss` uses `autograd.grad` to compute the per-layer gradient for the MUR loss.
 - `mur.mode=update` uses a single backward pass and scales layer gradients before `optimizer.step`.
 - Transformer++ here uses Pre-LN + RMSNorm + SwiGLU (optional RoPE via config).
-- Scaling configs default to the GPT-2 tokenizer for all architectures; swap `tokenizer_name` if needed.
+- All training configs use the `meta-llama/Llama-2-7b-hf` tokenizer by default.
 - Example configs use tiny splits for sanity checks; scale up by adjusting splits and steps.

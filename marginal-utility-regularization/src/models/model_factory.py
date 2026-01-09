@@ -10,7 +10,11 @@ def _infer_intermediate_size(hidden_size: int, multiplier: float) -> int:
 
 
 def build_tokenizer(config: Dict[str, Any]):
-    name = config.get("tokenizer_name") or config.get("model_name") or "gpt2"
+    model_cfg = config.get("model", {})
+    arch = model_cfg.get("arch")
+    if arch == "transformer++":
+        arch = "transformer_pp"
+    name = config.get("tokenizer_name") or "meta-llama/Llama-2-7b-hf"
     tokenizer = AutoTokenizer.from_pretrained(name)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token

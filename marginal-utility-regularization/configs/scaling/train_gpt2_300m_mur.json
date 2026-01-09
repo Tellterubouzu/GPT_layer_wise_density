@@ -17,12 +17,12 @@
   "gradient_accumulation_steps": 1,
   "max_grad_norm": 1.0,
   "seed": 42,
-  "tokenizer_name": "gpt2",
+  "tokenizer_name": "meta-llama/Llama-2-7b-hf",
   "run_name": "auto",
   "output_dir": "runs/{run_name}",
   "model": {
     "arch": "gpt2",
-    "vocab_size": 50257,
+    "vocab_size": 32000,
     "hidden_size": 1024,
     "num_layers": 20,
     "num_heads": 16,
@@ -31,7 +31,9 @@
     "resid_dropout": 0.1,
     "embd_dropout": 0.1,
     "tie_word_embeddings": true,
-    "intermediate_size": 4096
+    "intermediate_size": 4096,
+    "bos_token_id": 1,
+    "eos_token_id": 2
   },
   "mur": {
     "enabled": true,
