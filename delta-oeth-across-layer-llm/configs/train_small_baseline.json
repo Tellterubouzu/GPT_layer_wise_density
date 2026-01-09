@@ -1,0 +1,26 @@
+{
+  "run_name": "exp_small_baseline",
+  "output_dir": "runs/exp_small_baseline",
+  "model_name": "gpt2",
+  "dataset_name": "openwebtext",
+  "dataset_config": null,
+  "text_column": "text",
+  "train_split": "train[:0.5%]",
+  "eval_split": "train[:0.1%]",
+  "block_size": 256,
+  "batch_size": 2,
+  "eval_batch_size": 2,
+  "learning_rate": 5e-5,
+  "weight_decay": 0.01,
+  "num_train_steps": 200,
+  "warmup_steps": 20,
+  "eval_steps": 50,
+  "save_steps": 200,
+  "log_steps": 10,
+  "gradient_accumulation_steps": 1,
+  "max_grad_norm": 1.0,
+  "seed": 42,
+  "delta_orth": {
+    "enabled": false
+  }
+}
