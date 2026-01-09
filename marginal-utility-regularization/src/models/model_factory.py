@@ -1,3 +1,4 @@
+import torch
 from typing import Any, Dict
 
 from transformers import AutoTokenizer, GPT2Config, GPT2LMHeadModel, LlamaConfig, LlamaForCausalLM

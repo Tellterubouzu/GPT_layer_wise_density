@@ -2,7 +2,7 @@ import argparse
 import os
 import sys
 
-sys.path.append(os.path.join(os.path.dirname(__file__), "..", "src"))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from visualization.plot_metrics import load_json, load_jsonl, plot_layer_curve, plot_metric_curve
 

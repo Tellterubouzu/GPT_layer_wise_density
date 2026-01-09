@@ -2,15 +2,17 @@ import json
 import math
 import os
 import time
+from contextlib import nullcontext
 from datetime import datetime
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional
 
 import torch
-from datasets import load_dataset
+import torch.distributed as dist
+import wandb
 from torch.utils.data import DataLoader
-from transformers import AdamW, get_linear_schedule_with_warmup
-
+from transformers import get_cosine_schedule_with_warmup
+from torch.optim import AdamW
 from models.block_access import get_transformer_blocks
 from models.checkpointing import save_model_state
 from models.hidden_state_utils import hidden_states_to_deltas, resolve_layer_indices
@@ -19,7 +21,7 @@ from mur.optimizer_scaling import compute_layer_multipliers, scale_layer_grads
 from mur.regularizer import hinge_floor, schedule_value
 from mur.utility import compute_metric_values, reduce_token_values
 from utils.config import save_config
-from utils.data import build_dataloader
+from utils.data import build_streaming_dataloader
 from utils.logging import setup_logger
 from utils.metrics_store import MetricsStore
 from utils.seed import set_seed
@@ -167,31 +169,25 @@ def train(config: Dict[str, Any]) -> None:
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
+    use_bf16 = config.get("bf16", True)
+    if use_bf16 and device.type == "cuda" and not torch.cuda.is_bf16_supported():
+        raise RuntimeError("bf16 requested but CUDA device does not support bf16")
+    if use_bf16:
+        model.to(dtype=torch.bfloat16)
 
-    raw_train = load_dataset(config["dataset_name"], config.get("dataset_config"), split=config["train_split"])
-    raw_eval = load_dataset(config["dataset_name"], config.get("dataset_config"), split=config["eval_split"])
-
-    train_loader = build_dataloader(
-        raw_train,
-        tokenizer,
-        config["batch_size"],
-        config["block_size"],
-        shuffle=True,
-        text_column=config.get("text_column", "text"),
-    )
-    eval_loader = build_dataloader(
-        raw_eval,
-        tokenizer,
-        config["eval_batch_size"],
-        config["block_size"],
-        shuffle=False,
-        text_column=config.get("text_column", "text"),
+    train_loader = build_streaming_dataloader(
+        dataset_path=config["dataset_name"],
+        dataset_config=config.get("dataset_config"),
+        split=config["train_split"],
+        tokenizer=tokenizer,
+        batch_size=config["batch_size"],
+        seq_len=config["seq_len"],
+        num_workers=config.get("num_workers", 0),
+        shuffle_buffer=config.get("streaming_shuffle_buffer", 0),
+        seed=config.get("seed", 42),
     )
 
     optimizer = AdamW(model.parameters(), lr=config["learning_rate"], weight_decay=config["weight_decay"])
-    scheduler = get_linear_schedule_with_warmup(
-        optimizer, num_warmup_steps=config["warmup_steps"], num_training_steps=config["num_train_steps"]
-    )
 
     param_count = sum(p.numel() for p in model.parameters())
     param_count_m = param_count / 1e6
@@ -223,11 +219,34 @@ def train(config: Dict[str, Any]) -> None:
 
     mur_cfg = _resolve_mur_cfg(config.get("mur", {}))
     train_metrics = MetricsStore(os.path.join(output_dir, "metrics", "train.jsonl"))
-    eval_metrics = MetricsStore(os.path.join(output_dir, "metrics", "eval.jsonl"))
-
     train_iter = _cycle(train_loader)
-    num_steps = config["num_train_steps"]
+    num_steps = config.get("num_train_steps", 0)
     grad_accum = config.get("gradient_accumulation_steps", 1)
+    max_train_tokens = config.get("max_train_tokens")
+    warmup_ratio = float(config.get("warmup_ratio", 0.1))
+    world_size = dist.get_world_size() if dist.is_initialized() else 1
+    tokens_per_optimizer_step = config["batch_size"] * config["seq_len"] * grad_accum * world_size
+    if max_train_tokens is not None:
+        total_steps = max(1, math.ceil(max_train_tokens / tokens_per_optimizer_step))
+    else:
+        total_steps = max(1, int(num_steps))
+    warmup_steps = max(0, int(total_steps * warmup_ratio))
+    scheduler = get_cosine_schedule_with_warmup(
+        optimizer, num_warmup_steps=warmup_steps, num_training_steps=total_steps
+    )
+
+    wandb_enabled = config.get("wandb_enabled", True)
+    if wandb_enabled:
+        wandb.init(project=config["project_name"], name=config["run_name"], config=config)
+        wandb.log(
+            {
+                "param_count": param_count,
+                "param_count_m": param_count_m,
+                "total_steps": total_steps,
+                "warmup_steps": warmup_steps,
+            },
+            step=0,
+        )
 
     layer_indices: Optional[List[int]] = None
     mur_accum: Optional[MurAccumulator] = None
@@ -242,20 +261,30 @@ def train(config: Dict[str, Any]) -> None:
     logger.info("Starting training")
 
     optimizer.zero_grad()
-    for step in range(1, num_steps + 1):
+    stopped_early = False
+    step = 0
+    while True:
+        if max_train_tokens is not None and seen_tokens >= max_train_tokens:
+            stopped_early = True
+            break
+        if max_train_tokens is None and num_steps and step >= num_steps:
+            break
+        if max_train_tokens is not None and step >= total_steps:
+            stopped_early = True
+            break
+        step += 1
         batch = next(train_iter)
         input_ids = batch["input_ids"].to(device)
-        attention_mask = batch.get("attention_mask")
-        if attention_mask is not None:
-            attention_mask = attention_mask.to(device)
-
-        outputs = model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            labels=input_ids,
-            output_hidden_states=mur_cfg.enabled,
+        autocast_ctx = (
+            torch.autocast(device_type=device.type, dtype=torch.bfloat16) if use_bf16 else nullcontext()
         )
-        lm_loss = outputs.loss
+        with autocast_ctx:
+            outputs = model(
+                input_ids=input_ids,
+                labels=input_ids,
+                output_hidden_states=mur_cfg.enabled,
+            )
+            lm_loss = outputs.loss
         mur_weight = _mur_strength(step, mur_cfg)
 
         mur_loss = torch.tensor(0.0, device=device)
@@ -311,11 +340,14 @@ def train(config: Dict[str, Any]) -> None:
             scheduler.step()
             optimizer.zero_grad()
 
-        tokens_in_step = input_ids.numel()
+        tokens_in_step = input_ids.numel() * world_size
         seen_tokens += tokens_in_step
         log_tokens += tokens_in_step
         log_loss_sum += lm_loss.item()
         log_steps += 1
+
+        if max_train_tokens is not None and seen_tokens >= max_train_tokens:
+            stopped_early = True
 
         if step % config["log_steps"] == 0:
             elapsed = max(1e-8, time.time() - last_log_time)
@@ -343,22 +375,29 @@ def train(config: Dict[str, Any]) -> None:
                 record["mur_layer_means"] = layer_means
             train_metrics.write(record)
             logger.info(json.dumps(record, ensure_ascii=True))
+            if wandb_enabled:
+                wandb_record = {k: v for k, v in record.items() if not isinstance(v, list)}
+                wandb.log(wandb_record, step=step)
             last_log_time = time.time()
             log_tokens = 0
             log_loss_sum = 0.0
             log_steps = 0
 
-        if step % config["eval_steps"] == 0:
-            eval_loss = evaluate(model, eval_loader, device)
-            eval_record = {"step": step, "eval_loss": eval_loss, "eval_ppl": math.exp(eval_loss)}
-            eval_metrics.write(eval_record)
-            logger.info(json.dumps(eval_record, ensure_ascii=True))
-
-        if step % config["save_steps"] == 0 or step == num_steps:
+        if step % config["save_steps"] == 0 or (max_train_tokens is None and step == num_steps):
             save_model_state(model, output_dir)
             tokenizer.save_pretrained(output_dir)
 
-    logger.info("Training completed")
+        if stopped_early:
+            break
+
+    if stopped_early:
+        save_model_state(model, output_dir)
+        tokenizer.save_pretrained(output_dir)
+        logger.info("Training completed (stopped at token limit)")
+    else:
+        logger.info("Training completed")
+    if wandb_enabled:
+        wandb.finish()
 
 
 def evaluate(model: torch.nn.Module, dataloader: DataLoader, device: torch.device) -> float:
@@ -368,10 +407,7 @@ def evaluate(model: torch.nn.Module, dataloader: DataLoader, device: torch.devic
     with torch.no_grad():
         for batch in dataloader:
             input_ids = batch["input_ids"].to(device)
-            attention_mask = batch.get("attention_mask")
-            if attention_mask is not None:
-                attention_mask = attention_mask.to(device)
-            outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=input_ids)
+            outputs = model(input_ids=input_ids, labels=input_ids)
             loss = outputs.loss
             total_loss += loss.item() * input_ids.numel()
             total_tokens += input_ids.numel()

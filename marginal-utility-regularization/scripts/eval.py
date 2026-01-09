@@ -3,10 +3,9 @@ import json
 import os
 import sys
 
-sys.path.append(os.path.join(os.path.dirname(__file__), "..", "src"))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 import torch
-from datasets import load_dataset
 
 from eval.bi_metric import compute_bi_metric
 from eval.layer_drop import compute_layer_drop
@@ -15,7 +14,7 @@ from eval.ppl import compute_ppl
 from models.checkpointing import load_model_state
 from models.model_factory import build_model, build_tokenizer
 from utils.config import apply_overrides, load_config
-from utils.data import build_dataloader
+from utils.data import TokenLimitedLoader, build_streaming_dataloader
 from utils.logging import setup_logger
 from utils.seed import set_seed
 
@@ -54,20 +53,25 @@ def main() -> None:
         if not loaded:
             logger.warning("Model state not found in %s; using random initialization", args.run_dir)
 
-    raw_eval = load_dataset(config["dataset_name"], config.get("dataset_config"), split=config["eval_split"])
-    eval_loader = build_dataloader(
-        raw_eval,
-        tokenizer,
-        config["eval_batch_size"],
-        config["block_size"],
-        shuffle=False,
-        text_column=config.get("text_column", "text"),
+    eval_split = config.get("eval_split") or config.get("train_split") or "train"
+    eval_loader = build_streaming_dataloader(
+        dataset_path=config["dataset_name"],
+        dataset_config=config.get("dataset_config"),
+        split=eval_split,
+        tokenizer=tokenizer,
+        batch_size=config["eval_batch_size"],
+        seq_len=config["seq_len"],
+        num_workers=config.get("num_workers", 0),
+        shuffle_buffer=config.get("streaming_shuffle_buffer", 0),
+        seed=config.get("seed", 42),
     )
+    max_eval_tokens = config.get("max_eval_tokens")
+    limited_loader = TokenLimitedLoader(eval_loader, max_eval_tokens)
 
     metrics_dir = os.path.join(output_dir, "metrics")
     os.makedirs(metrics_dir, exist_ok=True)
 
-    ppl = compute_ppl(model, eval_loader, device)
+    ppl = compute_ppl(model, limited_loader, device)
     with open(os.path.join(metrics_dir, "ppl.json"), "w", encoding="utf-8") as f:
         json.dump(ppl, f, indent=2, ensure_ascii=True)
 
@@ -75,7 +79,7 @@ def main() -> None:
         mur = config["mur_stats"]
         stats = compute_mur_stats(
             model,
-            eval_loader,
+            limited_loader,
             device,
             metric=mur.get("metric", "cos"),
             mid_start=mur.get("mid_start", 0.0),
@@ -89,12 +93,12 @@ def main() -> None:
             json.dump(stats, f, indent=2, ensure_ascii=True)
 
     if config.get("bi_metric", {}).get("enabled", False):
-        bi = compute_bi_metric(model, eval_loader, device)
+        bi = compute_bi_metric(model, limited_loader, device)
         with open(os.path.join(metrics_dir, "bi_metric.json"), "w", encoding="utf-8") as f:
             json.dump(bi, f, indent=2, ensure_ascii=True)
 
     if config.get("layer_drop", {}).get("enabled", False):
-        drop = compute_layer_drop(model, eval_loader, device)
+        drop = compute_layer_drop(model, TokenLimitedLoader(eval_loader, max_eval_tokens), device)
         with open(os.path.join(metrics_dir, "layer_drop.json"), "w", encoding="utf-8") as f:
             json.dump(drop, f, indent=2, ensure_ascii=True)
 

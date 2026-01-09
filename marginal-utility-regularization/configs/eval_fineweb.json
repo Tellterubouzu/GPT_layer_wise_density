@@ -2,9 +2,10 @@
   "dataset_name": "HuggingFaceFW/fineweb-edu",
   "dataset_config": null,
   "text_column": "text",
-  "eval_split": "validation",
-  "block_size": 1024,
+  "eval_split": "train",
   "eval_batch_size": 2,
+  "max_eval_tokens": 100000000,
+  "streaming_shuffle_buffer": 0,
   "seed": 42,
   "mur_stats": {
     "enabled": true,
@@ -13,7 +14,7 @@
     "mid_end": 1.0,
     "tau": 0.1,
     "sample_k": 64,
-    "eps": 1e-6,
+    "eps": 1e-06,
     "fp32_dot": true
   },
   "bi_metric": {
@@ -21,5 +22,6 @@
   },
   "layer_drop": {
     "enabled": true
-  }
+  },
+  "seq_len": 1024
 }

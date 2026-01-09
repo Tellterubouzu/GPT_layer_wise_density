@@ -40,6 +40,15 @@ python3 scripts/plot_results.py \
   --out_dir runs/plots
 ```
 
+## Dataset + Evaluation
+
+- Training uses a streaming dataset (no train/val split, no shuffle by default).
+- Evaluation is run only after training with `scripts/eval.py`.
+- For FineWeb-Edu, PPL is computed over the first 100M tokens via `max_eval_tokens`.
+- Training runs in bfloat16 (`bf16: true` in train configs).
+- Training stops when `max_train_tokens` is reached; scheduler warmup is set by `warmup_ratio` (default 0.1).
+- Training logs are also sent to Weights & Biases when `wandb_enabled: true`.
+
 ## Scaling experiments (FineWeb-Edu)
 
 Scaling configs for GPT-2, Transformer++, and Llama (50M/100M/300M) live in `configs/scaling/`.
@@ -50,7 +59,7 @@ python3 scripts/train.py --config configs/scaling/train_gpt2_50m_baseline.json
 python3 scripts/train.py --config configs/scaling/train_llama_100m_mur.json
 ```
 
-Evaluation (FineWeb-Edu splits):
+Evaluation (FineWeb-Edu, first 100M tokens):
 
 ```bash
 python3 scripts/eval.py --config configs/eval_fineweb.json --run_dir runs/llama_100m_mur
@@ -65,6 +74,7 @@ python3 scripts/plot_scaling.py --runs_dir runs --out_dir runs/plots
 ## Notes
 
 - Models can be initialized from scratch by providing a `model` block in the config (see scaling configs).
+- Use `max_train_tokens` in the config to cap training by total seen tokens (stops early once reached).
 - `mur.mode=loss` uses `autograd.grad` to compute the per-layer gradient for the MUR loss.
 - `mur.mode=update` uses a single backward pass and scales layer gradients before `optimizer.step`.
 - Transformer++ here uses Pre-LN + RMSNorm + SwiGLU (optional RoPE via config).
