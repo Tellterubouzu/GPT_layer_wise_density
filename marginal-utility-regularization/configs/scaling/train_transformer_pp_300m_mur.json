@@ -3,14 +3,12 @@
   "dataset_config": null,
   "text_column": "text",
   "train_split": "train",
-  "eval_split": "validation",
-  "block_size": 1024,
+  "eval_split": "train",
   "batch_size": 2,
   "eval_batch_size": 2,
   "learning_rate": 0.0003,
   "weight_decay": 0.1,
   "num_train_steps": 10000,
-  "warmup_steps": 1000,
   "eval_steps": 1000,
   "save_steps": 10000,
   "log_steps": 50,
@@ -51,5 +49,11 @@
     "eps": 1e-06,
     "fp32_dot": true,
     "log_layer_stats": false
-  }
+  },
+  "max_train_tokens": 50000000000,
+  "streaming_shuffle_buffer": 0,
+  "seq_len": 1024,
+  "bf16": true,
+  "warmup_ratio": 0.1,
+  "wandb_enabled": true
 }

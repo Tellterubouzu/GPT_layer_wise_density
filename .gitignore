@@ -1,0 +1,16 @@
+*.pyc
+*.pyo
+*.pyd
+*.pyw
+*.pyz
+*.pywz
+*.pyzw
+*.pyzwz
+*.pyzwzw
+*.pyzwzwz
+*api.txt
+*.log
+*.bin
+*.pt
+wandb/
+__pycache__/
