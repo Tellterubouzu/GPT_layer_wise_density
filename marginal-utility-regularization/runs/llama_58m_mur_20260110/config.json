@@ -6,7 +6,7 @@
   "eval_split": "train",
   "batch_size": 32,
   "eval_batch_size": 2,
-  "learning_rate": 1e-3,
+  "learning_rate": 0.001,
   "weight_decay": 0.1,
   "num_train_steps": 10000,
   "eval_steps": 1000,
@@ -16,8 +16,8 @@
   "max_grad_norm": 1.0,
   "seed": 42,
   "tokenizer_name": "meta-llama/Llama-2-7b-hf",
-  "run_name": "auto",
-  "output_dir": "runs/{run_name}",
+  "run_name": "llama_58m_mur_20260110",
+  "output_dir": "runs/llama_58m_mur_20260110",
   "model": {
     "arch": "llama",
     "vocab_size": 32000,
@@ -57,5 +57,6 @@
   "seq_len": 512,
   "bf16": true,
   "warmup_ratio": 0.1,
-  "wandb_enabled": true
+  "wandb_enabled": true,
+  "project_name": "marginal-utility-regularization"
 }
