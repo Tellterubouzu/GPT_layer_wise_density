@@ -253,10 +253,10 @@ def train(config: Dict[str, Any]) -> None:
     wandb_enabled = config.get("wandb_enabled", True)
     if wandb_enabled:
         wandb_name = config["run_name"]
-        mur_cfg = config.get("mur", {})
-        if mur_cfg.get("enabled", False) and "mur_layer" not in wandb_name:
-            mid_start = mur_cfg.get("mid_start", 0.33)
-            mid_end = mur_cfg.get("mid_end", 0.67)
+        mur_cfg_dict = config.get("mur", {})
+        if mur_cfg_dict.get("enabled", False) and "mur_layer" not in wandb_name:
+            mid_start = mur_cfg_dict.get("mid_start", 0.33)
+            mid_end = mur_cfg_dict.get("mid_end", 0.67)
             layer_label = _format_layer_label(mid_start, mid_end)
             if "_mur_" in wandb_name:
                 wandb_name = wandb_name.replace("_mur_", f"_mur_layer{layer_label}_")
