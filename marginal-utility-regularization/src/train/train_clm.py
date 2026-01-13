@@ -149,15 +149,30 @@ def _layer_stats(layer_means: List[float], tau: float) -> Dict[str, float]:
     return {"mur_mean": mean_value, "mur_frac_below_tau": frac_below}
 
 
+def _format_layer_label(mid_start: float, mid_end: float) -> str:
+    if 0.0 < mid_start <= 1.0 and 0.0 < mid_end <= 1.0:
+        start_pct = int(mid_start * 100)
+        end_pct = int(mid_end * 100) - 1
+        if end_pct < start_pct:
+            end_pct = start_pct
+        return f"{start_pct}_{end_pct}"
+    return f"{int(mid_start)}_{int(mid_end)}"
+
+
 def _infer_run_name(config: Dict[str, Any], param_count_m: float) -> str:
     model_cfg = config.get("model", {})
     arch = model_cfg.get("arch", "gpt2")
     if arch == "transformer++":
         arch = "transformer_pp"
-    variant = "mur" if config.get("mur", {}).get("enabled", False) else "baseline"
     size_tag = f"{int(round(param_count_m))}m"
     date_tag = datetime.now().strftime("%Y%m%d")
-    return f"{arch}_{size_tag}_{variant}_{date_tag}"
+    mur_cfg = config.get("mur", {})
+    if mur_cfg.get("enabled", False):
+        mid_start = mur_cfg.get("mid_start", 0.33)
+        mid_end = mur_cfg.get("mid_end", 0.67)
+        layer_label = _format_layer_label(mid_start, mid_end)
+        return f"{arch}_{size_tag}_mur_layer{layer_label}_{date_tag}"
+    return f"{arch}_{size_tag}_baseline_{date_tag}"
 
 
 def train(config: Dict[str, Any]) -> None:
@@ -237,7 +252,17 @@ def train(config: Dict[str, Any]) -> None:
 
     wandb_enabled = config.get("wandb_enabled", True)
     if wandb_enabled:
-        wandb.init(project=config["project_name"], name=config["run_name"], config=config)
+        wandb_name = config["run_name"]
+        mur_cfg = config.get("mur", {})
+        if mur_cfg.get("enabled", False) and "mur_layer" not in wandb_name:
+            mid_start = mur_cfg.get("mid_start", 0.33)
+            mid_end = mur_cfg.get("mid_end", 0.67)
+            layer_label = _format_layer_label(mid_start, mid_end)
+            if "_mur_" in wandb_name:
+                wandb_name = wandb_name.replace("_mur_", f"_mur_layer{layer_label}_")
+            else:
+                wandb_name = f"{wandb_name}_mur_layer{layer_label}"
+        wandb.init(project=config["project_name"], name=wandb_name, config=config)
         wandb.log(
             {
                 "param_count": param_count,
