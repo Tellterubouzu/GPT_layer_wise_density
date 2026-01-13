@@ -21,6 +21,3 @@ python scripts/eval.py \
 python scripts/eval.py \
     --config configs/eval_scaling/eval_transformer_pp_51m.json \
     --run_dir runs/transformer_pp_51m_mur_20260111/
-python scripts/eval.py \
-    --config configs/eval_scaling/eval_transformer_pp_51m.json \
-    --run_dir runs/transformer_pp_51m_mur_20260110/

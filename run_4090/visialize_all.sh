@@ -16,5 +16,5 @@ python3 scripts/plot_results.py \
 
 python3 scripts/plot_results.py \
   --baseline_dir runs/transformer_pp_51m_baseline_20260110 \
-  --mur_dir runs/transformer_pp_51m_mur_2026011 \
+  --mur_dir runs/transformer_pp_51m_mur_20260111 \
   --out_dir runs/plots/transformer_pp_51m
