@@ -1,9 +1,7 @@
 import argparse
 import json
 import os
-import re
 import sys
-from typing import Dict, Optional, Tuple
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
@@ -20,58 +18,6 @@ from utils.data import TokenLimitedLoader, build_streaming_dataloader
 from utils.logging import setup_logger
 from utils.seed import set_seed
 
-
-def _parse_run_name(run_name: str) -> Optional[Tuple[str, str, str]]:
-    for arch in ("transformer_pp", "gpt2", "llama"):
-        prefix = f"{arch}_"
-        if run_name.startswith(prefix):
-            rest = run_name[len(prefix) :]
-            parts = rest.split("_")
-            if len(parts) >= 2:
-                return arch, parts[0], parts[1]
-    return None
-
-
-def _parse_size(tag: str) -> Optional[int]:
-    match = re.match(r"(\\d+)", tag)
-    if not match:
-        return None
-    return int(match.group(1))
-
-
-def _infer_model_config_from_run_name(run_name: str) -> Optional[Dict]:
-    parsed = _parse_run_name(run_name)
-    if parsed is None:
-        return None
-    arch, size_tag, variant = parsed
-    size_value = _parse_size(size_tag)
-    if size_value is None:
-        return None
-
-    configs_dir = os.path.join(os.path.dirname(__file__), "..", "configs", "scaling")
-    if not os.path.isdir(configs_dir):
-        return None
-
-    candidates = []
-    for fname in os.listdir(configs_dir):
-        if not fname.endswith(".json"):
-            continue
-        if not fname.startswith(f"train_{arch}_") or f"_{variant}.json" not in fname:
-            continue
-        parts = fname.split("_")
-        if len(parts) < 4:
-            continue
-        size_part = parts[2]
-        candidate_size = _parse_size(size_part)
-        if candidate_size is None:
-            continue
-        candidates.append((abs(candidate_size - size_value), os.path.join(configs_dir, fname)))
-
-    if not candidates:
-        return None
-
-    _, best_path = sorted(candidates, key=lambda x: x[0])[0]
-    return load_config(best_path)
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Evaluate MUR experiments")
@@ -96,19 +42,6 @@ def main() -> None:
             model_config = load_config(run_config_path)
             if "tokenizer_name" not in model_config and "tokenizer_name" in config:
                 model_config["tokenizer_name"] = config["tokenizer_name"]
-        if "model" not in model_config and "model_name" not in model_config:
-            if "model" in config:
-                model_config["model"] = config["model"]
-            if "model_name" in config:
-                model_config["model_name"] = config["model_name"]
-        if "model" not in model_config and "model_name" not in model_config:
-            run_name = os.path.basename(os.path.normpath(args.run_dir))
-            fallback = _infer_model_config_from_run_name(run_name)
-            if fallback is not None:
-                model_config = fallback
-                if "tokenizer_name" not in model_config and "tokenizer_name" in config:
-                    model_config["tokenizer_name"] = config["tokenizer_name"]
-                logger.warning("Using fallback model config from configs/scaling for %s", run_name)
 
     tokenizer = build_tokenizer(model_config)
     model = build_model(model_config)
