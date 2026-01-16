@@ -1,0 +1,28 @@
+{
+  "model_name": "gpt2",
+  "dataset_name": "openwebtext",
+  "dataset_config": null,
+  "text_column": "text",
+  "eval_split": "train",
+  "eval_batch_size": 2,
+  "max_eval_tokens": 1000000,
+  "streaming_shuffle_buffer": 0,
+  "seed": 42,
+  "mur_stats": {
+    "enabled": true,
+    "metric": "cos",
+    "mid_start": 0.0,
+    "mid_end": 1.0,
+    "tau": 0.1,
+    "sample_k": 64,
+    "eps": 1e-06,
+    "fp32_dot": true
+  },
+  "bi_metric": {
+    "enabled": true
+  },
+  "layer_drop": {
+    "enabled": true
+  },
+  "seq_len": 256
+}
