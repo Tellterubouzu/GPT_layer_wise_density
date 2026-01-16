@@ -19,8 +19,19 @@ from torch.optim import AdamW
 from transformers import get_cosine_schedule_with_warmup
 
 from eval.bi_metric import compute_bi_metric
+from models.block_access import get_transformer_blocks
 from models.checkpointing import save_model_state
+from models.hidden_state_utils import hidden_states_to_deltas, resolve_layer_indices
 from models.model_factory import build_model, build_tokenizer
+from mur.optimizer_scaling import compute_layer_multipliers, scale_layer_grads
+from train.train_clm import (
+    MurAccumulator,
+    _compute_layer_means,
+    _compute_mur_loss,
+    _make_grad_hook,
+    _mur_strength,
+    _resolve_mur_cfg,
+)
 from utils.config import apply_overrides, load_config, save_config
 from utils.data import TokenLimitedLoader, build_streaming_dataloader
 from utils.logging import setup_logger
@@ -29,9 +40,12 @@ from utils.seed import set_seed
 
 
 DEFAULT_CONFIGS = {
-    "gpt2": "configs/scaling/train_gpt2_50m_baseline.json",
-    "llama": "configs/scaling/train_llama_50m_baseline.json",
-    "transformer_pp": "configs/scaling/train_transformer_pp_50m_baseline.json",
+    "gpt2_baseline": "configs/bi_config/bi_gpt2_baseline.json",
+    "gpt2_mur": "configs/bi_config/bi_gpt2_mur.json",
+    "llama_baseline": "configs/bi_config/bi_llama_baseline.json",
+    "llama_mur": "configs/bi_config/bi_llama_mur.json",
+    "transformer_pp_baseline": "configs/bi_config/bi_transformer_pp_baseline.json",
+    "transformer_pp_mur": "configs/bi_config/bi_transformer_pp_mur.json",
 }
 
 
@@ -76,7 +90,7 @@ def _normalize_training_config(config: Dict[str, Any]) -> List[str]:
     _set_default("weight_decay", 0.1, "default")
     _set_default("log_steps", 2500, "default")
     _set_default("max_grad_norm", 1.0, "default")
-    _set_default("gradient_accumulation_steps", 1, "default")
+    _set_default("gradient_accumulation_steps", 0, "default")
     _set_default("warmup_ratio", 0.1, "default")
 
     return warnings
@@ -365,6 +379,10 @@ def _train_and_eval_bi(
     log_tokens = 0
     last_log_time = time.time()
     last_bi_mean: Optional[float] = None
+    mur_cfg = _resolve_mur_cfg(config.get("mur", {}))
+    layer_indices: Optional[List[int]] = None
+    mur_accum: Optional[MurAccumulator] = None
+    blocks = None
 
     logger.info("Starting BI experiment training")
     while True:
@@ -379,19 +397,73 @@ def _train_and_eval_bi(
             torch.autocast(device_type=device.type, dtype=torch.bfloat16) if use_bf16 else nullcontext()
         )
         with autocast_ctx:
-            outputs = model(input_ids=input_ids, labels=input_ids)
+            outputs = model(input_ids=input_ids, labels=input_ids, output_hidden_states=mur_cfg.enabled)
             lm_loss = outputs.loss
+        mur_weight = _mur_strength(step, mur_cfg)
+        mur_loss = torch.tensor(0.0, device=device)
+        handles = []
+        grad_store: Dict[int, torch.Tensor] = {}
+        delta_store: Dict[int, torch.Tensor] = {}
+
+        if mur_cfg.enabled and mur_weight > 0.0:
+            hidden_states = outputs.hidden_states
+            if hidden_states is None:
+                raise ValueError("MUR enabled but hidden states are missing")
+            num_layers = len(hidden_states) - 1
+            if layer_indices is None:
+                layer_indices = resolve_layer_indices(num_layers, mur_cfg.mid_start, mur_cfg.mid_end)
+            if mur_cfg.mode == "loss":
+                mur_loss, _ = _compute_mur_loss(lm_loss, hidden_states, layer_indices, mur_cfg)
+            elif mur_cfg.mode == "update":
+                if mur_accum is None:
+                    mur_accum = MurAccumulator(len(layer_indices))
+                if blocks is None:
+                    blocks = get_transformer_blocks(model)
+                deltas = hidden_states_to_deltas(hidden_states)
+                for idx in layer_indices:
+                    delta_store[idx] = deltas[idx].detach()
+                    handles.append(hidden_states[idx + 1].register_hook(_make_grad_hook(grad_store, idx)))
+            else:
+                raise ValueError(f"Unknown MUR mode: {mur_cfg.mode}")
+
+        total_loss = lm_loss + mur_weight * mur_loss
+        total_loss_value = float(total_loss.detach().item())
         if accum_enabled:
-            loss = lm_loss / grad_accum
+            loss = total_loss / grad_accum
             loss.backward()
+        else:
+            total_loss.backward()
+
+        if mur_cfg.enabled and mur_cfg.mode == "update" and mur_weight > 0.0:
+            for handle in handles:
+                handle.remove()
+            if layer_indices is None or mur_accum is None:
+                raise ValueError("MUR update mode missing layer indices")
+            layer_means = _compute_layer_means(layer_indices, grad_store, delta_store, mur_cfg)
+            mur_accum.update(layer_means)
+
+        if accum_enabled:
             if step % grad_accum == 0:
+                if mur_cfg.enabled and mur_cfg.mode == "update" and mur_weight > 0.0:
+                    if layer_indices is None or mur_accum is None or blocks is None:
+                        raise ValueError("MUR update mode missing state")
+                    avg_means = mur_accum.average()
+                    multipliers = compute_layer_multipliers(layer_indices, avg_means, mur_cfg.tau, mur_weight)
+                    scale_layer_grads(blocks, multipliers)
+                    mur_accum.reset()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
                 optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad()
                 optimizer_step += 1
         else:
-            lm_loss.backward()
+            if mur_cfg.enabled and mur_cfg.mode == "update" and mur_weight > 0.0:
+                if layer_indices is None or mur_accum is None or blocks is None:
+                    raise ValueError("MUR update mode missing state")
+                avg_means = mur_accum.average()
+                multipliers = compute_layer_multipliers(layer_indices, avg_means, mur_cfg.tau, mur_weight)
+                scale_layer_grads(blocks, multipliers)
+                mur_accum.reset()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
             optimizer.step()
             scheduler.step()
@@ -421,10 +493,10 @@ def _train_and_eval_bi(
                 "token_per_sec": log_tokens / elapsed,
                 "VRAM_allocated_bytes": torch.cuda.memory_allocated(device) if device.type == "cuda" else 0,
                 "seened_tokens": seen_tokens,
-                "mur_loss": 0.0,
-                "mur_weight": 0.0,
-                "total_loss": lm_loss.item(),
-                "mur_mode": "disabled",
+                "mur_loss": float(mur_loss.detach().item()),
+                "mur_weight": mur_weight,
+                "total_loss": total_loss_value,
+                "mur_mode": mur_cfg.mode if mur_cfg.enabled else "disabled",
             }
             if last_bi_mean is not None:
                 record["bi_mean"] = last_bi_mean
