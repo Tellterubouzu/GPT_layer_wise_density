@@ -19,6 +19,7 @@ from torch.optim import AdamW
 from transformers import get_cosine_schedule_with_warmup
 
 from eval.bi_metric import compute_bi_metric
+from eval.layer_drop import compute_layer_drop
 from models.block_access import get_transformer_blocks
 from models.checkpointing import save_model_state
 from models.hidden_state_utils import hidden_states_to_deltas, resolve_layer_indices
@@ -111,11 +112,12 @@ def _build_checkpoint_schedule(
         return []
     schedule = []
     early_end = min(max_tokens, early_until)
-    current = early_interval
-    while current <= early_end:
-        schedule.append(current)
-        current += early_interval
-    if max_tokens > early_until:
+    if early_interval > 0:
+        current = early_interval
+        while current <= early_end:
+            schedule.append(current)
+            current += early_interval
+    if max_tokens > early_until and late_interval > 0:
         current = early_until + late_interval
         while current <= max_tokens:
             schedule.append(current)
@@ -150,6 +152,16 @@ def _evaluate_bi(
 ) -> Dict[str, List[float]]:
     limited_loader = TokenLimitedLoader(eval_loader, max_eval_tokens)
     return compute_bi_metric(model, limited_loader, device)
+
+
+def _evaluate_layer_drop(
+    model: torch.nn.Module,
+    eval_loader,
+    max_eval_tokens: int,
+    device: torch.device,
+) -> Dict[str, List[float]]:
+    limited_loader = TokenLimitedLoader(eval_loader, max_eval_tokens)
+    return compute_layer_drop(model, limited_loader, device)
 
 
 def _load_jsonl(path: str) -> List[Dict[str, Any]]:
@@ -257,6 +269,103 @@ def _plot_bi_results(run_dir: str, run_label: str) -> None:
     _plot_bi_mean(records, os.path.join(plots_dir, "bi_mean.png"), f"BI mean ({run_label})")
 
 
+def _plot_layer_drop_heatmap(records: List[Dict[str, Any]], out_path: str, title: str) -> None:
+    if not records:
+        return
+    records = sorted(records, key=lambda r: r["checkpoint_tokens"])
+    tokens = [r["checkpoint_tokens"] for r in records]
+    deltas = [r["delta_ppl"] for r in records]
+    matrix = list(map(list, zip(*deltas)))
+    plt.figure(figsize=(10, 6))
+    plt.imshow(matrix, aspect="auto", origin="lower")
+    tick_stride = max(1, len(tokens) // 6)
+    tick_indices = list(range(0, len(tokens), tick_stride))
+    if (len(tokens) - 1) not in tick_indices:
+        tick_indices.append(len(tokens) - 1)
+    plt.xticks(tick_indices, [_format_tokens(tokens[i]) for i in tick_indices])
+    plt.xlabel("Tokens trained")
+    plt.ylabel("Layer")
+    plt.title(title)
+    plt.colorbar(label="Delta PPL")
+    plt.tight_layout()
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    plt.savefig(out_path)
+    plt.close()
+
+
+def _plot_layer_drop_mean(records: List[Dict[str, Any]], out_path: str, title: str) -> None:
+    if not records:
+        return
+    records = sorted(records, key=lambda r: r["checkpoint_tokens"])
+    tokens = [r["checkpoint_tokens"] for r in records]
+    means = []
+    for record in records:
+        values = record["delta_ppl"]
+        means.append(sum(values) / max(1, len(values)))
+    x_vals = [t / 1_000_000_000 for t in tokens]
+    plt.figure(figsize=(8, 4))
+    plt.plot(x_vals, means)
+    plt.xlabel("Tokens trained (B)")
+    plt.ylabel("Mean delta PPL")
+    plt.title(title)
+    plt.tight_layout()
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    plt.savefig(out_path)
+    plt.close()
+
+
+def _plot_layer_drop_traces(records: List[Dict[str, Any]], out_path: str, title: str) -> None:
+    if not records:
+        return
+    records = sorted(records, key=lambda r: r["checkpoint_tokens"])
+    tokens = [r["checkpoint_tokens"] for r in records]
+    deltas = [r["delta_ppl"] for r in records]
+    num_layers = len(deltas[0])
+    indices = [0]
+    if num_layers > 1:
+        indices.extend(
+            sorted(
+                set(
+                    [
+                        num_layers // 4,
+                        num_layers // 2,
+                        (3 * num_layers) // 4,
+                        num_layers - 1,
+                    ]
+                )
+            )
+        )
+    indices = indices[:6]
+    x_vals = [t / 1_000_000_000 for t in tokens]
+    plt.figure(figsize=(10, 5))
+    for idx in indices:
+        series = [vals[idx] for vals in deltas]
+        plt.plot(x_vals, series, label=f"layer {idx}")
+    plt.xlabel("Tokens trained (B)")
+    plt.ylabel("Delta PPL")
+    plt.title(title)
+    plt.legend()
+    plt.tight_layout()
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    plt.savefig(out_path)
+    plt.close()
+
+
+def _plot_layer_drop_results(run_dir: str, run_label: str) -> None:
+    metrics_path = os.path.join(run_dir, "metrics", "layer_drop_over_time.jsonl")
+    if not os.path.exists(metrics_path):
+        return
+    records = _load_jsonl(metrics_path)
+    plots_dir = os.path.join(run_dir, "plots")
+    _plot_layer_drop_heatmap(records, os.path.join(plots_dir, "layer_drop_heatmap.png"), f"Layer drop ({run_label})")
+    _plot_layer_drop_traces(
+        records,
+        os.path.join(plots_dir, "layer_drop_traces.png"),
+        f"Layer drop traces ({run_label})",
+    )
+    _plot_layer_drop_mean(records, os.path.join(plots_dir, "layer_drop_mean.png"), f"Layer drop mean ({run_label})")
+
+
 def _cleanup_run_dir(run_dir: str, keep_names: Optional[List[str]] = None) -> None:
     if not os.path.isdir(run_dir):
         return
@@ -361,6 +470,7 @@ def _train_and_eval_bi(
 
     train_metrics = MetricsStore(os.path.join(output_dir, "metrics", "train.jsonl"))
     bi_metrics = MetricsStore(os.path.join(output_dir, "metrics", "bi_over_time.jsonl"))
+    drop_metrics = MetricsStore(os.path.join(output_dir, "metrics", "layer_drop_over_time.jsonl"))
 
     checkpoint_targets = _build_checkpoint_schedule(
         max_train_tokens,
@@ -369,6 +479,13 @@ def _train_and_eval_bi(
         late_interval=args.late_checkpoint_interval,
     )
     checkpoint_idx = 0
+    drop_checkpoint_targets = _build_checkpoint_schedule(
+        max_train_tokens,
+        early_until=args.layer_drop_early_checkpoint_tokens,
+        early_interval=args.layer_drop_early_checkpoint_interval,
+        late_interval=args.layer_drop_late_checkpoint_interval,
+    )
+    drop_checkpoint_idx = 0
 
     train_iter = _cycle(train_loader)
     seen_tokens = 0
@@ -379,6 +496,7 @@ def _train_and_eval_bi(
     log_tokens = 0
     last_log_time = time.time()
     last_bi_mean: Optional[float] = None
+    last_drop_mean: Optional[float] = None
     mur_cfg = _resolve_mur_cfg(config.get("mur", {}))
     layer_indices: Optional[List[int]] = None
     mur_accum: Optional[MurAccumulator] = None
@@ -500,6 +618,8 @@ def _train_and_eval_bi(
             }
             if last_bi_mean is not None:
                 record["bi_mean"] = last_bi_mean
+            if last_drop_mean is not None:
+                record["layer_drop_mean"] = last_drop_mean
             train_metrics.write(record)
             logger.info(json.dumps(record, ensure_ascii=True))
             if wandb_enabled:
@@ -537,6 +657,35 @@ def _train_and_eval_bi(
                     step=step,
                 )
             checkpoint_idx += 1
+
+        while drop_checkpoint_idx < len(drop_checkpoint_targets) and seen_tokens >= drop_checkpoint_targets[drop_checkpoint_idx]:
+            checkpoint_tokens = drop_checkpoint_targets[drop_checkpoint_idx]
+            drop = _evaluate_layer_drop(model, eval_loader, args.layer_drop_eval_tokens, device)
+            delta_ppl = drop.get("delta_ppl", [])
+            base_ppl = drop.get("base_ppl")
+            drop_mean = sum(delta_ppl) / max(1, len(delta_ppl))
+            last_drop_mean = drop_mean
+            record = {
+                "checkpoint_tokens": checkpoint_tokens,
+                "seen_tokens": seen_tokens,
+                "step": step,
+                "optimizer_step": optimizer_step,
+                "delta_ppl": delta_ppl,
+                "base_ppl": base_ppl,
+                "delta_ppl_mean": drop_mean,
+            }
+            drop_metrics.write(record)
+            logger.info(json.dumps(record, ensure_ascii=True))
+            if wandb_enabled:
+                wandb.log(
+                    {
+                        "layer_drop_mean": drop_mean,
+                        "layer_drop_base_ppl": base_ppl,
+                        "layer_drop_checkpoint_tokens": checkpoint_tokens,
+                    },
+                    step=step,
+                )
+            drop_checkpoint_idx += 1
 
         if max_train_tokens > 0 and seen_tokens >= max_train_tokens:
             break
@@ -583,6 +732,7 @@ def _run_from_config(config_path: str, args) -> str:
         warnings,
     )
     _plot_bi_results(output_dir, run_name)
+    _plot_layer_drop_results(output_dir, run_name)
     if not args.keep_artifacts:
         _cleanup_run_dir(output_dir, keep_names=["metrics", "plots"])
     return output_dir
@@ -598,6 +748,10 @@ def main() -> None:
     parser.add_argument("--early_checkpoint_tokens", type=int, default=200_000_000)
     parser.add_argument("--early_checkpoint_interval", type=int, default=25_000_000)
     parser.add_argument("--late_checkpoint_interval", type=int, default=100_000_000)
+    parser.add_argument("--layer_drop_eval_tokens", type=int, default=1_000_000)
+    parser.add_argument("--layer_drop_early_checkpoint_tokens", type=int, default=200_000_000)
+    parser.add_argument("--layer_drop_early_checkpoint_interval", type=int, default=100_000_000)
+    parser.add_argument("--layer_drop_late_checkpoint_interval", type=int, default=200_000_000)
     parser.add_argument("--plot_only", action="store_true")
     parser.add_argument("--run_dir", action="append", default=[], help="Existing run dir for plotting")
     parser.add_argument("--keep_artifacts", action="store_true", help="Keep checkpoints and logs after plotting")
@@ -611,6 +765,7 @@ def main() -> None:
             if not os.path.isdir(run_dir):
                 continue
             _plot_bi_results(run_dir, os.path.basename(run_dir))
+            _plot_layer_drop_results(run_dir, os.path.basename(run_dir))
             if not args.keep_artifacts:
                 _cleanup_run_dir(run_dir, keep_names=["metrics", "plots"])
         return
