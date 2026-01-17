@@ -54,6 +54,6 @@
   "streaming_shuffle_buffer": 0,
   "seq_len": 512,
   "bf16": true,
-  "warmup_ratio": 0.1,
+  "warmup_ratio": 1e-5,
   "wandb_enabled": true
 }
