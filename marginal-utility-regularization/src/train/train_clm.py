@@ -1,6 +1,7 @@
 import json
 import math
 import os
+import random
 import time
 from contextlib import nullcontext
 from datetime import datetime
@@ -46,6 +47,16 @@ class MurConfig:
     log_layer_stats: bool = False
 
 
+@dataclass
+class FreezeConfig:
+    enabled: bool = False
+    mode: str = "random_near_input"
+    layer_idx: Optional[int] = None
+    near_input_ratio: float = 0.25
+    near_input_layers: Optional[int] = None
+    seed: Optional[int] = None
+
+
 class MurAccumulator:
     def __init__(self, num_layers: int) -> None:
         self.sums = [0.0 for _ in range(num_layers)]
@@ -72,6 +83,59 @@ def _resolve_mur_cfg(raw: Dict[str, Any]) -> MurConfig:
         if hasattr(cfg, key):
             setattr(cfg, key, value)
     return cfg
+
+
+def _resolve_freeze_cfg(raw: Dict[str, Any]) -> FreezeConfig:
+    cfg = FreezeConfig()
+    for key, value in raw.items():
+        if hasattr(cfg, key):
+            setattr(cfg, key, value)
+    return cfg
+
+
+def _resolve_freeze_candidates(num_layers: int, cfg: FreezeConfig) -> List[int]:
+    if num_layers <= 0:
+        return []
+    if cfg.near_input_layers is not None:
+        count = int(cfg.near_input_layers)
+    else:
+        count = int(round(num_layers * float(cfg.near_input_ratio)))
+    count = max(1, min(num_layers, count))
+    return list(range(count))
+
+
+def _select_freeze_layer(num_layers: int, cfg: FreezeConfig, seed: int) -> tuple[int, List[int]]:
+    if num_layers <= 0:
+        raise ValueError("No layers available to freeze")
+    if cfg.mode == "fixed":
+        if cfg.layer_idx is None:
+            raise ValueError("freeze.layer_idx must be set when freeze.mode is fixed")
+        if cfg.layer_idx < 0 or cfg.layer_idx >= num_layers:
+            raise ValueError(f"freeze.layer_idx {cfg.layer_idx} out of range for {num_layers} layers")
+        return cfg.layer_idx, [cfg.layer_idx]
+    rng = random.Random(seed)
+    if cfg.mode == "random":
+        return rng.randrange(num_layers), list(range(num_layers))
+    if cfg.mode == "random_near_input":
+        candidates = _resolve_freeze_candidates(num_layers, cfg)
+        return rng.choice(candidates), candidates
+    raise ValueError(f"Unknown freeze mode: {cfg.mode}")
+
+
+def _apply_freeze(
+    model: torch.nn.Module,
+    config: Dict[str, Any],
+    cfg: FreezeConfig,
+) -> tuple[Optional[int], Optional[List[int]]]:
+    if not cfg.enabled:
+        return None, None
+    blocks = get_transformer_blocks(model)
+    num_layers = len(blocks)
+    seed = cfg.seed if cfg.seed is not None else int(config.get("seed", 42))
+    layer_idx, candidates = _select_freeze_layer(num_layers, cfg, seed)
+    for param in blocks[layer_idx].parameters():
+        param.requires_grad = False
+    return layer_idx, candidates
 
 
 def _mur_strength(step: int, cfg: MurConfig) -> float:
@@ -167,12 +231,23 @@ def _infer_run_name(config: Dict[str, Any], param_count_m: float) -> str:
     size_tag = f"{int(round(param_count_m))}m"
     date_tag = datetime.now().strftime("%Y%m%d")
     mur_cfg = config.get("mur", {})
+    freeze_cfg = config.get("freeze", {})
+    freeze_tag = None
+    if freeze_cfg.get("enabled", False):
+        layer_idx = freeze_cfg.get("selected_layer")
+        if layer_idx is None:
+            layer_idx = freeze_cfg.get("layer_idx")
+        freeze_tag = f"freeze_layer{layer_idx}" if layer_idx is not None else "freeze"
     if mur_cfg.get("enabled", False):
         mid_start = mur_cfg.get("mid_start", 0.33)
         mid_end = mur_cfg.get("mid_end", 0.67)
         layer_label = _format_layer_label(mid_start, mid_end)
-        return f"{arch}_{size_tag}_mur_layer{layer_label}_{date_tag}"
-    return f"{arch}_{size_tag}_baseline_{date_tag}"
+        base_name = f"{arch}_{size_tag}_mur_layer{layer_label}"
+    else:
+        base_name = f"{arch}_{size_tag}_baseline"
+    if freeze_tag:
+        base_name = f"{base_name}_{freeze_tag}"
+    return f"{base_name}_{date_tag}"
 
 
 def train(config: Dict[str, Any]) -> None:
@@ -190,6 +265,15 @@ def train(config: Dict[str, Any]) -> None:
     if use_bf16:
         model.to(dtype=torch.bfloat16)
 
+    freeze_cfg = _resolve_freeze_cfg(config.get("freeze", {}))
+    freeze_layer: Optional[int] = None
+    freeze_candidates: Optional[List[int]] = None
+    if freeze_cfg.enabled:
+        config.setdefault("freeze", {})
+        freeze_layer, freeze_candidates = _apply_freeze(model, config, freeze_cfg)
+        config["freeze"]["selected_layer"] = freeze_layer
+        config["freeze"]["candidate_layers"] = freeze_candidates
+
     train_loader = build_streaming_dataloader(
         dataset_path=config["dataset_name"],
         dataset_config=config.get("dataset_config"),
@@ -202,10 +286,13 @@ def train(config: Dict[str, Any]) -> None:
         seed=config.get("seed", 42),
     )
 
-    optimizer = AdamW(model.parameters(), lr=config["learning_rate"], weight_decay=config["weight_decay"])
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    optimizer = AdamW(trainable_params, lr=config["learning_rate"], weight_decay=config["weight_decay"])
 
     param_count = sum(p.numel() for p in model.parameters())
     param_count_m = param_count / 1e6
+    trainable_param_count = sum(p.numel() for p in trainable_params)
+    trainable_param_count_m = trainable_param_count / 1e6
     run_name = _infer_run_name(config, param_count_m)
     config["project_name"] = "marginal-utility-regularization"
     config["run_name"] = run_name
@@ -222,7 +309,17 @@ def train(config: Dict[str, Any]) -> None:
     save_config(config, os.path.join(output_dir, "config.json"))
 
     with open(os.path.join(output_dir, "model_params.json"), "w", encoding="utf-8") as f:
-        json.dump({"param_count": param_count, "param_count_m": param_count_m}, f, indent=2, ensure_ascii=True)
+        json.dump(
+            {
+                "param_count": param_count,
+                "param_count_m": param_count_m,
+                "trainable_param_count": trainable_param_count,
+                "trainable_param_count_m": trainable_param_count_m,
+            },
+            f,
+            indent=2,
+            ensure_ascii=True,
+        )
 
     model_cfg = config.get("model")
     if model_cfg and model_cfg.get("vocab_size") and model_cfg.get("vocab_size") != len(tokenizer):
@@ -267,8 +364,11 @@ def train(config: Dict[str, Any]) -> None:
             {
                 "param_count": param_count,
                 "param_count_m": param_count_m,
+                "trainable_param_count": trainable_param_count,
+                "trainable_param_count_m": trainable_param_count_m,
                 "total_steps": total_steps,
                 "warmup_steps": warmup_steps,
+                "freeze_layer": freeze_layer,
             },
             step=0,
         )
@@ -394,6 +494,7 @@ def train(config: Dict[str, Any]) -> None:
                 "total_loss": total_loss.item() * grad_accum,
                 "lr": scheduler.get_last_lr()[0],
                 "mur_mode": mur_cfg.mode if mur_cfg.enabled else "disabled",
+                "freeze_layer": freeze_layer,
             }
             record.update(stats)
             if mur_cfg.enabled and mur_cfg.log_layer_stats:
