@@ -57,6 +57,14 @@ class FreezeConfig:
     seed: Optional[int] = None
 
 
+@dataclass
+class HierarchicalFreezeConfig:
+    enabled: bool = False
+    mode: str = "input"
+    unfreeze_tokens: int = 0
+    seed: Optional[int] = None
+
+
 class MurAccumulator:
     def __init__(self, num_layers: int) -> None:
         self.sums = [0.0 for _ in range(num_layers)]
@@ -91,6 +99,41 @@ def _resolve_freeze_cfg(raw: Dict[str, Any]) -> FreezeConfig:
         if hasattr(cfg, key):
             setattr(cfg, key, value)
     return cfg
+
+
+def _resolve_hierarchical_freeze_cfg(raw: Dict[str, Any]) -> HierarchicalFreezeConfig:
+    cfg = HierarchicalFreezeConfig()
+    for key, value in raw.items():
+        if hasattr(cfg, key):
+            setattr(cfg, key, value)
+    return cfg
+
+
+def _build_unfreeze_order(num_layers: int, cfg: HierarchicalFreezeConfig, seed: int) -> List[int]:
+    order = list(range(num_layers))
+    if cfg.mode == "input":
+        return order
+    if cfg.mode == "output":
+        return list(reversed(order))
+    if cfg.mode == "random":
+        rng = random.Random(seed)
+        rng.shuffle(order)
+        return order
+    raise ValueError(f"Unknown hierarchical freeze mode: {cfg.mode}")
+
+
+def _apply_hierarchical_freeze(
+    model: torch.nn.Module,
+    config: Dict[str, Any],
+    cfg: HierarchicalFreezeConfig,
+) -> tuple[List[torch.nn.Module], List[int]]:
+    blocks = get_transformer_blocks(model)
+    for block in blocks:
+        for param in block.parameters():
+            param.requires_grad = False
+    seed = cfg.seed if cfg.seed is not None else int(config.get("seed", 42))
+    order = _build_unfreeze_order(len(blocks), cfg, seed)
+    return blocks, order
 
 
 def _resolve_freeze_candidates(num_layers: int, cfg: FreezeConfig) -> List[int]:
@@ -238,6 +281,16 @@ def _infer_run_name(config: Dict[str, Any], param_count_m: float) -> str:
         if layer_idx is None:
             layer_idx = freeze_cfg.get("layer_idx")
         freeze_tag = f"freeze_layer{layer_idx}" if layer_idx is not None else "freeze"
+    hfreeze_cfg = config.get("hierarchical_freeze", {})
+    hfreeze_tag = None
+    if hfreeze_cfg.get("enabled", False):
+        mode = hfreeze_cfg.get("mode", "input")
+        unfreeze_tokens = hfreeze_cfg.get("unfreeze_tokens")
+        token_tag = f"t{int(unfreeze_tokens)}" if unfreeze_tokens is not None else None
+        if token_tag:
+            hfreeze_tag = f"hfreeze_{mode}_{token_tag}"
+        else:
+            hfreeze_tag = f"hfreeze_{mode}"
     if mur_cfg.get("enabled", False):
         mid_start = mur_cfg.get("mid_start", 0.33)
         mid_end = mur_cfg.get("mid_end", 0.67)
@@ -247,6 +300,8 @@ def _infer_run_name(config: Dict[str, Any], param_count_m: float) -> str:
         base_name = f"{arch}_{size_tag}_baseline"
     if freeze_tag:
         base_name = f"{base_name}_{freeze_tag}"
+    if hfreeze_tag:
+        base_name = f"{base_name}_{hfreeze_tag}"
     return f"{base_name}_{date_tag}"
 
 
@@ -265,10 +320,32 @@ def train(config: Dict[str, Any]) -> None:
     if use_bf16:
         model.to(dtype=torch.bfloat16)
 
+    hfreeze_cfg = _resolve_hierarchical_freeze_cfg(config.get("hierarchical_freeze", {}))
+    hfreeze_blocks: Optional[List[torch.nn.Module]] = None
+    hfreeze_order: Optional[List[int]] = None
+    hfreeze_next_idx = 0
+    hfreeze_interval: Optional[int] = None
+    hfreeze_total_layers = 0
+    hfreeze_total_tokens = 0
+
     freeze_cfg = _resolve_freeze_cfg(config.get("freeze", {}))
     freeze_layer: Optional[int] = None
     freeze_candidates: Optional[List[int]] = None
-    if freeze_cfg.enabled:
+
+    if hfreeze_cfg.enabled:
+        config.setdefault("hierarchical_freeze", {})
+        hfreeze_blocks, hfreeze_order = _apply_hierarchical_freeze(model, config, hfreeze_cfg)
+        hfreeze_total_layers = len(hfreeze_order)
+        hfreeze_total_tokens = max(0, int(hfreeze_cfg.unfreeze_tokens))
+        config["hierarchical_freeze"]["order"] = hfreeze_order
+        if hfreeze_total_tokens == 0 and hfreeze_blocks:
+            for idx in hfreeze_order:
+                for param in hfreeze_blocks[idx].parameters():
+                    param.requires_grad = True
+            hfreeze_next_idx = hfreeze_total_layers
+        else:
+            hfreeze_interval = max(1, int(math.ceil(hfreeze_total_tokens / max(1, hfreeze_total_layers))))
+    elif freeze_cfg.enabled:
         config.setdefault("freeze", {})
         freeze_layer, freeze_candidates = _apply_freeze(model, config, freeze_cfg)
         config["freeze"]["selected_layer"] = freeze_layer
@@ -287,7 +364,10 @@ def train(config: Dict[str, Any]) -> None:
     )
 
     trainable_params = [p for p in model.parameters() if p.requires_grad]
-    optimizer = AdamW(trainable_params, lr=config["learning_rate"], weight_decay=config["weight_decay"])
+    if hfreeze_cfg.enabled:
+        optimizer = AdamW(model.parameters(), lr=config["learning_rate"], weight_decay=config["weight_decay"])
+    else:
+        optimizer = AdamW(trainable_params, lr=config["learning_rate"], weight_decay=config["weight_decay"])
 
     param_count = sum(p.numel() for p in model.parameters())
     param_count_m = param_count / 1e6
@@ -369,6 +449,9 @@ def train(config: Dict[str, Any]) -> None:
                 "total_steps": total_steps,
                 "warmup_steps": warmup_steps,
                 "freeze_layer": freeze_layer,
+                "hierarchical_freeze_unfrozen_layers": hfreeze_next_idx,
+                "hierarchical_freeze_total_layers": hfreeze_total_layers,
+                "hierarchical_freeze_total_tokens": hfreeze_total_tokens,
             },
             step=0,
         )
@@ -471,6 +554,22 @@ def train(config: Dict[str, Any]) -> None:
         log_loss_sum += lm_loss.item()
         log_steps += 1
 
+        if (
+            hfreeze_cfg.enabled
+            and hfreeze_blocks is not None
+            and hfreeze_order is not None
+            and hfreeze_interval is not None
+            and hfreeze_next_idx < hfreeze_total_layers
+        ):
+            while hfreeze_next_idx < hfreeze_total_layers:
+                threshold = (hfreeze_next_idx + 1) * hfreeze_interval
+                if seen_tokens < threshold:
+                    break
+                layer_idx = hfreeze_order[hfreeze_next_idx]
+                for param in hfreeze_blocks[layer_idx].parameters():
+                    param.requires_grad = True
+                hfreeze_next_idx += 1
+
         if max_train_tokens is not None and seen_tokens >= max_train_tokens:
             stopped_early = True
 
@@ -488,6 +587,7 @@ def train(config: Dict[str, Any]) -> None:
                 "token_per_sec": log_tokens / elapsed,
                 "VRAM_allocated_bytes": torch.cuda.memory_allocated(device) if device.type == "cuda" else 0,
                 "seened_tokens": seen_tokens,
+                "seened_token_global": seen_tokens,
                 "current_lr": scheduler.get_last_lr()[0],
                 "mur_loss": mur_loss.item(),
                 "mur_weight": mur_weight,
@@ -495,6 +595,11 @@ def train(config: Dict[str, Any]) -> None:
                 "lr": scheduler.get_last_lr()[0],
                 "mur_mode": mur_cfg.mode if mur_cfg.enabled else "disabled",
                 "freeze_layer": freeze_layer,
+                "hierarchical_freeze_unfrozen_layers": hfreeze_next_idx,
+                "hierarchical_freeze_total_layers": hfreeze_total_layers,
+                "hierarchical_freeze_next_layer": (
+                    hfreeze_order[hfreeze_next_idx] if hfreeze_order and hfreeze_next_idx < hfreeze_total_layers else None
+                ),
             }
             record.update(stats)
             if mur_cfg.enabled and mur_cfg.log_layer_stats:
